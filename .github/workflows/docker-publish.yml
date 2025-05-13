@@ -1,10 +1,5 @@
 name: Docker
 
-# This workflow uses actions that are not certified by GitHub.
-# They are provided by a third-party and are governed by
-# separate terms of service, privacy policy, and support
-# documentation.
-
 on:
   push:
     branches: [ "main" ]
@@ -15,83 +10,196 @@ on:
   workflow_dispatch:
 
 env:
-  # Use docker.io for Docker Hub if empty
   REGISTRY: ghcr.io
-  # github.repository as <account>/<repo>
+  # github.repository is <owner>/<repo>
   IMAGE_NAME: ${{ github.repository }}
-
+  # Pinned Cosign version for reproducibility
+  COSIGN_VERSION: v2.5.0 # Check for the latest stable release
 
 jobs:
-  build:
-
+  build-and-push-image:
     runs-on: ubuntu-latest
     permissions:
-      contents: read
-      packages: write
-      # This is used to complete the identity challenge
-      # with sigstore/fulcio when running outside of PRs.
-      id-token: write
+      contents: read      # To checkout the repository
+      packages: write    # To push Docker images to GHCR
+      id-token: write    # To use OIDC for keyless signing with Sigstore
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
-      # Install the cosign tool except on PR
-      # https://github.com/sigstore/cosign-installer
-      - name: Install cosign
-        if: github.event_name != 'pull_request'
-        uses: sigstore/cosign-installer@6e04d228eb30da1757ee4e1dd75a0ec73a653e06 #v3.1.1
-        with:
-          cosign-release: 'v2.1.1'
-
-      # Set up BuildKit Docker container builder to be able to build
-      # multi-platform images and export cache
-      # https://github.com/docker/setup-buildx-action
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@f95db51fddba0c2d1ec667646a06c2ce06100226 # v3.0.0
+        id: buildx
+        run: |
+          # Create and use a new builder instance
+          docker buildx create --use
+          # Ensure the builder is bootstrapped (ready to build)
+          docker buildx inspect --bootstrap
+          # List available builders (optional, for debugging)
+          docker buildx ls
+          echo "Successfully set up Docker Buildx"
 
-      # Login against a Docker registry except on PR
-      # https://github.com/docker/login-action
-      - name: Log into registry ${{ env.REGISTRY }}
-        if: github.event_name != 'pull_request'
-        uses: docker/login-action@343f7c4344506bcbf9b4de18042ae17996df046d # v3.0.0
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Log in to ${{ env.REGISTRY }}
+        if: github.event_name != 'pull_request' # Don't log in for PRs if not pushing
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ${{ env.REGISTRY }} -u ${{ github.actor }} --password-stdin
 
-      # Extract metadata (tags, labels) for Docker
-      # https://github.com/docker/metadata-action
-      - name: Extract Docker metadata
+      - name: Generate Docker metadata (tags and labels)
         id: meta
-        uses: docker/metadata-action@96383f45573cb7f253c731d3b3ab81c87ef81934 # v5.0.0
-        with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+        run: |
+          IMAGE_ID="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}"
+          
+          # Initialize empty lists for tags and labels
+          declare -a TAG_ARGS_LIST=()
+          declare -a LABEL_ARGS_LIST=()
+          declare -a COSIGN_SIGN_TARGETS=()
 
-      # Build and push Docker image with Buildx (don't push on PR)
-      # https://github.com/docker/build-push-action
+          # Common OCI labels
+          LABEL_ARGS_LIST+=("--label" "org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}")
+          LABEL_ARGS_LIST+=("--label" "org.opencontainers.image.created=$(date -u --rfc-3339=seconds)")
+          LABEL_ARGS_LIST+=("--label" "org.opencontainers.image.revision=${{ github.sha }}")
+
+          # --- Tagging Logic ---
+          # For PRs, build with a unique PR tag but don't push (controlled later)
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            PR_BRANCH_NAME_SANITIZED=$(echo "${{ github.head_ref }}" | sed 's/[^a-zA-Z0-9.-]/-/g')
+            PR_TAG="${IMAGE_ID}:pr-${{ github.event.number }}-${PR_BRANCH_NAME_SANITIZED}-${{ github.sha }}"
+            TAG_ARGS_LIST+=("--tag" "$PR_TAG")
+            LABEL_ARGS_LIST+=("--label" "org.opencontainers.image.version=pr-${{ github.event.number }}")
+          else # For push events (main branch or tags)
+            # Tag with commit SHA
+            SHA_TAG="${IMAGE_ID}:${{ github.sha }}"
+            TAG_ARGS_LIST+=("--tag" "$SHA_TAG")
+            COSIGN_SIGN_TARGETS+=("$SHA_TAG") # Add to list of images to sign if pushed
+
+            if [[ "${{ github.ref_type }}" == "tag" && "${{ github.ref_name }}" == v*.*.* ]]; then
+              # Git tag push (e.g., v1.2.3)
+              VERSION_TAG="${IMAGE_ID}:${{ github.ref_name }}"
+              TAG_ARGS_LIST+=("--tag" "$VERSION_TAG")
+              COSIGN_SIGN_TARGETS+=("$VERSION_TAG")
+              LABEL_ARGS_LIST+=("--label" "org.opencontainers.image.version=${{ github.ref_name }}")
+              
+              # Optional: add minor (vX.Y) and major (vX) tags
+              MINOR_TAG="${IMAGE_ID}:$(echo "${{ github.ref_name }}" | cut -d. -f1,2)" # v1.2
+              MAJOR_TAG="${IMAGE_ID}:$(echo "${{ github.ref_name }}" | cut -d. -f1)"   # v1
+              TAG_ARGS_LIST+=("--tag" "$MINOR_TAG")
+              COSIGN_SIGN_TARGETS+=("$MINOR_TAG")
+              TAG_ARGS_LIST+=("--tag" "$MAJOR_TAG")
+              COSIGN_SIGN_TARGETS+=("$MAJOR_TAG")
+
+            elif [[ "${{ github.ref_name }}" == "main" ]]; then
+              # Push to main branch
+              LATEST_TAG="${IMAGE_ID}:latest"
+              TAG_ARGS_LIST+=("--tag" "$LATEST_TAG")
+              COSIGN_SIGN_TARGETS+=("$LATEST_TAG")
+              LABEL_ARGS_LIST+=("--label" "org.opencontainers.image.version=latest-${{ github.sha }}")
+            fi
+          fi
+          
+          # Convert arrays to space-separated strings for output
+          echo "tags_args_string=${TAG_ARGS_LIST[*]}" >> $GITHUB_OUTPUT
+          echo "labels_args_string=${LABEL_ARGS_LIST[*]}" >> $GITHUB_OUTPUT
+          echo "cosign_targets_string=${COSIGN_SIGN_TARGETS[*]}" >> $GITHUB_OUTPUT
+
+          echo "::group::Generated Docker Metadata"
+          echo "Tags args: ${TAG_ARGS_LIST[*]}"
+          echo "Labels args: ${LABEL_ARGS_LIST[*]}"
+          echo "Cosign targets: ${COSIGN_SIGN_TARGETS[*]}"
+          echo "::endgroup::"
+
       - name: Build and push Docker image
         id: build-and-push
-        uses: docker/build-push-action@0565240e2d4ab88bba5387d719585280857ece09 # v5.0.0
-        with:
-          context: .
-          push: ${{ github.event_name != 'pull_request' }}
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+        run: |
+          METADATA_FILE="buildx-metadata.json"
+          PUSH_FLAG=""
+          # Only push if not a pull request
+          if [[ "${{ github.event_name }}" != "pull_request" ]]; then
+            PUSH_FLAG="--push"
+          fi
 
-      # Sign the resulting Docker image digest except on PRs.
-      # This will only write to the public Rekor transparency log when the Docker
-      # repository is public to avoid leaking data.  If you would like to publish
-      # transparency data even for private images, pass --force to cosign below.
-      # https://github.com/sigstore/cosign
+          # Check if there are any tags to apply
+          if [[ -z "${{ steps.meta.outputs.tags_args_string }}" ]]; then
+            echo "No tags generated. Skipping build."
+            # Set empty digest if skipping
+            echo "digest=" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          # The --provenance default changed in buildx v0.10. For consistency with typical usage of the original
+          # action (which might not have generated attestations by default for all users),
+          # explicitly set it. Modern best practice is `true` or `mode=max`.
+          # Set to `false` if you don't want SLSA attestations.
+          # Set to `true` or `mode=max` if you do (recommended for supply chain security).
+          # For this example, let's set it to false to avoid generating extra artifacts unless intended.
+          docker buildx build . \
+            --file ./Dockerfile \
+            ${{ steps.meta.outputs.labels_args_string }} \
+            ${{ steps.meta.outputs.tags_args_string }} \
+            --cache-from type=gha \
+            --cache-to type=gha,mode=max \
+            --metadata-file "$METADATA_FILE" \
+            --provenance=false \
+            $PUSH_FLAG
+          
+          # If pushed, extract digest. Otherwise, set empty.
+          if [[ "$PUSH_FLAG" == "--push" ]]; then
+            # The key in metadata.json for the main image digest is "containerimage.digest" with BuildKit >= v0.11.
+            # For older versions or specific build patterns, it might differ.
+            IMAGE_DIGEST=$(jq -r '."containerimage.digest"' "$METADATA_FILE")
+
+            if [ -z "$IMAGE_DIGEST" ] || [ "$IMAGE_DIGEST" == "null" ]; then
+              echo "Warning: 'containerimage.digest' not found in $METADATA_FILE."
+              echo "Attempting to find any sha256 digest in the metadata..."
+              # Fallback: try to find any string that looks like a sha256 digest. This is less reliable.
+              IMAGE_DIGEST=$(jq -r '.. | select(type == "string" and test("^sha256:[a-f0-9]{64}$")) | first // empty' "$METADATA_FILE")
+            fi
+
+            if [ -z "$IMAGE_DIGEST" ] || [ "$IMAGE_DIGEST" == "null" ]; then
+              echo "Error: Could not extract image digest from $METADATA_FILE"
+              echo "--- Metadata File Content ---"
+              cat "$METADATA_FILE"
+              echo "--- End Metadata File Content ---"
+              exit 1
+            fi
+            echo "Image digest: $IMAGE_DIGEST"
+            echo "digest=${IMAGE_DIGEST}" >> $GITHUB_OUTPUT
+          else
+            echo "Image not pushed (PR or no tags). No digest generated."
+            echo "digest=" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Install Cosign
+        if: github.event_name != 'pull_request' && steps.build-and-push.outputs.digest != ''
+        run: |
+          # Install Cosign binary
+          # Using sudo to install to /usr/local/bin for system-wide access
+          # Alternatively, install to a directory in GITHUB_PATH for user-level access
+          sudo curl -sL -o /usr/local/bin/cosign "https://github.com/sigstore/cosign/releases/download/${COSIGN_VERSION}/cosign-linux-amd64"
+          sudo chmod +x /usr/local/bin/cosign
+          echo "Cosign version:"
+          cosign version
+
       - name: Sign the published Docker image
-        if: ${{ github.event_name != 'pull_request' }}
+        # Only sign if not a PR, and if a digest was successfully extracted (meaning image was pushed)
+        if: github.event_name != 'pull_request' && steps.build-and-push.outputs.digest != ''
         env:
-          # https://docs.github.com/en/actions/security-guides/security-hardening-for-github-actions#using-an-intermediate-environment-variable
-          TAGS: ${{ steps.meta.outputs.tags }}
-          DIGEST: ${{ steps.build-and-push.outputs.digest }}
-        # This step uses the identity token to provision an ephemeral certificate
-        # against the sigstore community Fulcio instance.
-        run: echo "${TAGS}" | xargs -I {} cosign sign --yes {}@${DIGEST}
+          # Enable OIDC-based keyless signing (EXPERIMENTAL is historical, now standard)
+          COSIGN_EXPERIMENTAL: "true"
+          # Space-separated list of image tags that were pushed
+          IMAGE_TAGS_TO_SIGN: ${{ steps.meta.outputs.cosign_targets_string }}
+          IMAGE_DIGEST: ${{ steps.build-and-push.outputs.digest }}
+        run: |
+          echo "Image Digest to sign: ${IMAGE_DIGEST}"
+          if [ -z "${IMAGE_TAGS_TO_SIGN}" ]; then
+            echo "No image tags specified for signing. This might be an error in metadata generation."
+            exit 1
+          fi
+          
+          echo "The following image references (tag@digest) will be signed:"
+          # Cosign signs the digest and can optionally associate this signature with tags.
+          # Signing `image_tag@digest` ensures the signature is for that specific manifest digest
+          # and the tag points to it at the time of signing.
+          for img_tag_full_path in ${IMAGE_TAGS_TO_SIGN}; do
+            echo "  - ${img_tag_full_path}@${IMAGE_DIGEST}"
+            cosign sign --yes "${img_tag_full_path}@${IMAGE_DIGEST}"
+          done
+          echo "Successfully signed all targeted image references."
