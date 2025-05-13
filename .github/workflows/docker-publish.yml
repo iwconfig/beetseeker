@@ -48,14 +48,16 @@ jobs:
         run: |
           IMAGE_ID="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}"
           
-          # Initialize empty lists for tags and labels
           declare -a TAG_ARGS_LIST=()
           declare -a LABEL_ARGS_LIST=()
           declare -a COSIGN_SIGN_TARGETS=()
 
           # Common OCI labels
           LABEL_ARGS_LIST+=("--label" "org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}")
-          LABEL_ARGS_LIST+=("--label" "org.opencontainers.image.created=$(date -u --rfc-3339=seconds)")
+          # Use ISO 8601 standard for timestamps (YYYY-MM-DDTHH:MM:SSZ or YYYY-MM-DDTHH:MM:SS+00:00)
+          # This format does not contain spaces.
+          CREATED_DATE=$(date -u --iso-8601=seconds) 
+          LABEL_ARGS_LIST+=("--label" "org.opencontainers.image.created=${CREATED_DATE}")
           LABEL_ARGS_LIST+=("--label" "org.opencontainers.image.revision=${{ github.sha }}")
 
           # --- Tagging Logic ---
