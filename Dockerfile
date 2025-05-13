@@ -1,8 +1,7 @@
-FROM python:3.9-slim-buster
+FROM python:3-bookworm
 
+COPY . /app
 WORKDIR /app
-
-COPY main.py slskd.py betanin.py ./
-COPY example_config.py ./
+RUN pip install -r requirements.txt
 
 CMD ["python", "main.py"]
